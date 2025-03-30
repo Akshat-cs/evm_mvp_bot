@@ -9,7 +9,7 @@ Demo - https://youtu.be/0T_v2nctLmA?si=pT-25C07k_4lfIP2
 
 ## Steps to run the bot on your Local Machine
 
-1. `git clone https://github.com/Akshat-cs/Base-sniper-bot.git`
+1. `git clone https://github.com/Akshat-cs/evm_mvp_bot.git`
 2. `npm install`
-3. Add your `WALLET_PRIVATE_KEY` and `BITQUERY_TOKEN` in the `.env` file. To get the OAuth Token follow these instructions [here](https://docs.bitquery.io/docs/authorisation/how-to-generate/).
-4. Run this command in terminal to start the script `ts-node index.ts 0.001`. Here 0.001 is the amount of WETH you are swapping for the newly created pool with Token B on Base Mainnet.
+3. Add your `WALLET_PRIVATE_KEY` and `BITQUERY_TOKEN` in the `.env.example` file and remove the .example extension. To get the OAuth Token follow these instructions [here](https://docs.bitquery.io/docs/authorisation/how-to-generate/).
+4. Run this command in terminal to start the script `ts-node index.ts`. As soon as you run it, mempool trades will be start tracking in realtime and as soon as theres a buy trade of trade amount greater than 10$, the bot automatically sells our 50% of the holdings of the token.
