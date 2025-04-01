@@ -13,7 +13,11 @@ import {
 } from "./config";
 
 const main = async () => {
+  console.log("Starting MEV bot...");
+  console.log("Monitoring for trades with target token...");
+
   // Wait for the getTokens function to resolve
+  // This will also wait for the Bitquery subscription to detect a trade
   const { Token0, Token1 } = await getTokens();
 
   // Ensure tokens are not null
@@ -21,25 +25,44 @@ const main = async () => {
     throw new Error("Tokens are not initialized.");
   }
 
-  const tokenFrom = Token0.token;
+  const tokenFrom = Token0.token; // Base token
   const tokenFromContract = Token0.contract;
-  const tokenTo = Token1.token;
+  const tokenTo = Token1.token; // WETH
 
-  if (typeof process.argv[2] === "undefined") {
-    throw new Error(`Pass in the amount of ${tokenFrom.symbol} to swap.`);
-  }
+  console.log(
+    `Token setup complete. From: ${tokenFrom.symbol}, To: ${tokenTo.symbol}`
+  );
 
+  // Get wallet details
   const walletAddress = await signer.getAddress();
-  const amountIn = ethers.utils.parseUnits(process.argv[2], tokenFrom.decimals);
-  const balance = await tokenFromContract.balanceOf(walletAddress);
+  console.log(`Using wallet: ${walletAddress}`);
 
-  if (!(await Token0.walletHas(signer, amountIn))) {
-    throw new Error(
-      `Not enough ${tokenFrom.symbol}. Needs ${amountIn}, but balance is ${balance}.`
-    );
+  // Check WETH balance
+  const balance = await tokenFromContract.balanceOf(walletAddress);
+  console.log(
+    `Current ${tokenFrom.symbol} balance: ${ethers.utils.formatUnits(
+      balance,
+      tokenFrom.decimals
+    )}`
+  );
+
+  // Calculate 50% of the balance
+  const amountIn = balance.div(2);
+  console.log(
+    `Swapping 50% of balance: ${ethers.utils.formatUnits(
+      amountIn,
+      tokenFrom.decimals
+    )} ${tokenFrom.symbol}`
+  );
+
+  if (amountIn.isZero()) {
+    throw new Error(`No ${tokenFrom.symbol} balance to swap.`);
   }
 
+  // Find the best route for the swap
+  console.log("Finding optimal swap route...");
   const router = new AlphaRouter({ chainId: CHAIN_ID, provider });
+
   const route = await router.route(
     CurrencyAmount.fromRawAmount(tokenFrom, amountIn.toString()),
     tokenTo,
@@ -57,15 +80,28 @@ const main = async () => {
   }
 
   console.log(
-    `Swapping ${amountIn} ${tokenFrom.symbol} for ${route.quote.toFixed(
+    `Found route: Swapping ${ethers.utils.formatUnits(
+      amountIn,
+      tokenFrom.decimals
+    )} ${tokenFrom.symbol} for approximately ${route.quote.toFixed(
       tokenTo.decimals
     )} ${tokenTo.symbol}.`
   );
 
+  // Check token allowance
   const allowance: BigNumber = await tokenFromContract.allowance(
     walletAddress,
     SWAP_ROUTER_ADDRESS
   );
+
+  console.log(
+    `Current allowance: ${ethers.utils.formatUnits(
+      allowance,
+      tokenFrom.decimals
+    )} ${tokenFrom.symbol}`
+  );
+
+  // In index.ts, replace the buildSwapTransaction and swapTransaction section with this:
 
   const buildSwapTransaction = (
     walletAddress: string,
@@ -77,58 +113,126 @@ const main = async () => {
       to: routerAddress,
       value: BigNumber.from(route.methodParameters?.value),
       from: walletAddress,
-      gasLimit: BigNumber.from("2000000"), // Set your desired gas limit here
-      // Optionally, you can specify gasPrice here if needed
-      // gasPrice: YOUR_GAS_PRICE_IN_WEI
     };
   };
 
-  const swapTransaction = buildSwapTransaction(
+  // Get base transaction
+  const baseTransaction = buildSwapTransaction(
     walletAddress,
     SWAP_ROUTER_ADDRESS,
     route
   );
 
+  // Modified gas settings to work with your available balance
+  const baseFeeEstimate = await provider.getGasPrice();
+  let maxPriorityFeePerGas = ethers.utils.parseUnits("1", "gwei"); // Lower priority fee
+  let maxFeePerGas = baseFeeEstimate.add(maxPriorityFeePerGas); // Base fee + priority fee
+
+  // Check if we have enough ETH for the transaction
+  const estimatedGasCost = maxFeePerGas.mul(3000000); // Gas limit * gas price
+  const ethBalance = await signer.getBalance();
+
+  if (ethBalance.lt(estimatedGasCost)) {
+    console.log(`Warning: Gas cost might be too high for your balance`);
+    console.log(
+      `Estimated gas cost: ${ethers.utils.formatEther(estimatedGasCost)} ETH`
+    );
+    console.log(`Your balance: ${ethers.utils.formatEther(ethBalance)} ETH`);
+
+    // Use more economical gas settings if balance is low
+    const economicalMaxPriorityFee = ethers.utils.parseUnits("0.5", "gwei");
+    const economicalMaxFee = baseFeeEstimate.add(economicalMaxPriorityFee);
+
+    // Update gas parameters
+    maxPriorityFeePerGas = economicalMaxPriorityFee;
+    maxFeePerGas = economicalMaxFee;
+  }
+
+  // Set a more reasonable gas limit
+  const gasLimit = ethers.utils.hexlify(500000); // Lower gas limit
+
+  // Update transaction parameters with balanced gas settings
+  const swapTransaction = {
+    ...baseTransaction,
+    maxPriorityFeePerGas,
+    maxFeePerGas,
+    gasLimit,
+  };
+
+  console.log("Transaction built with parameters:", {
+    to: swapTransaction.to,
+    value: swapTransaction.value?.toString(),
+    gasLimit: swapTransaction.gasLimit?.toString(),
+    maxFeePerGas: swapTransaction.maxFeePerGas?.toString(),
+    maxPriorityFeePerGas: swapTransaction.maxPriorityFeePerGas?.toString(),
+  });
+
+  // Function to execute the swap transaction
   const attemptSwapTransaction = async (
     signer: ethers.Wallet,
     transaction: TransactionRequest
   ) => {
     const signerBalance = await signer.getBalance();
+    console.log(
+      `ETH balance for gas: ${ethers.utils.formatEther(signerBalance)} ETH`
+    );
 
-    if (!signerBalance.gte(transaction.gasLimit || "0")) {
-      throw new Error(`Not enough ETH to cover gas: ${transaction.gasLimit}`);
+    if (transaction.gasLimit && signerBalance.lt(transaction.gasLimit)) {
+      throw new Error(
+        `Not enough ETH to cover gas: Need at least ${ethers.utils.formatEther(
+          transaction.gasLimit
+        )} ETH`
+      );
     }
 
+    console.log("Submitting transaction...");
     // Send the transaction with the specified gas-related parameters
-    signer.sendTransaction(transaction).then((tx) => {
-      tx.wait().then((receipt) => {
-        console.log("Completed swap transaction:", receipt.transactionHash);
-      });
-    });
+    const tx = await signer.sendTransaction(transaction);
+    console.log(`Transaction submitted: ${tx.hash}`);
+    console.log(`Check at: https://etherscan.io/tx/${tx.hash}`);
+
+    console.log("Waiting for confirmation...");
+    const receipt = await tx.wait();
+    console.log(`Transaction confirmed in block ${receipt.blockNumber}`);
+    console.log(`Gas used: ${receipt.gasUsed.toString()}`);
+    console.log(
+      `Transaction status: ${receipt.status === 1 ? "Success" : "Failed"}`
+    );
+    console.log("Swap complete!");
+
+    // Check the new token balance
+    const newBalance = await Token0.contract.balanceOf(walletAddress);
+    console.log(
+      `New ${tokenTo.symbol} balance: ${ethers.utils.formatUnits(
+        newBalance,
+        tokenTo.decimals
+      )}`
+    );
   };
 
+  // Check and approve if needed, then execute the swap
   if (allowance.lt(amountIn)) {
-    console.log(`Requesting ${tokenFrom.symbol} approval…`);
+    console.log(`Requesting ${tokenFrom.symbol} approval...`);
 
-    const approvalTx = await tokenFromContract
-      .connect(signer)
-      .approve(
-        SWAP_ROUTER_ADDRESS,
-        ethers.utils.parseUnits(amountIn.mul(1000).toString(), 18)
-      );
-
-    approvalTx.wait(3).then(() => {
-      attemptSwapTransaction(signer, swapTransaction);
-    });
-  } else {
-    console.log(
-      `Sufficient ${tokenFrom.symbol} allowance, no need for approval.`
+    const approvalTx = await tokenFromContract.connect(signer).approve(
+      SWAP_ROUTER_ADDRESS,
+      ethers.constants.MaxUint256 // Approve max amount
     );
-    attemptSwapTransaction(signer, swapTransaction);
+
+    console.log(`Approval transaction submitted: ${approvalTx.hash}`);
+    console.log("Waiting for approval confirmation...");
+
+    await approvalTx.wait(1); // Wait for 1 confirmation
+    console.log("Approval confirmed. Executing swap...");
+
+    await attemptSwapTransaction(signer, swapTransaction);
+  } else {
+    console.log(`Sufficient ${tokenFrom.symbol} allowance. Executing swap...`);
+    await attemptSwapTransaction(signer, swapTransaction);
   }
 };
 
 main().catch((error) => {
-  console.error(error);
+  console.error("Error in main function:", error);
   process.exit(1);
 });

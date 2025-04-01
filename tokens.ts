@@ -1,9 +1,16 @@
 import { Token } from "@uniswap/sdk-core";
-import { Signer, BigNumber, BigNumberish, Contract, providers } from "ethers";
-import { CHAIN_ID } from "./config";
+import {
+  Signer,
+  constants,
+  BigNumber,
+  BigNumberish,
+  Contract,
+  providers,
+} from "ethers";
+import { CHAIN_ID, SWAP_ROUTER_ADDRESS } from "./config";
 import { Provider } from "@ethersproject/providers";
-import axios, { AxiosRequestConfig } from "axios";
 import { config as loadEnvironmentVariables } from "dotenv";
+import WebSocket from "ws";
 
 loadEnvironmentVariables();
 
@@ -64,45 +71,163 @@ type Tokens = {
   Token1: TokenWithContract | null;
 };
 
+// Define the token addresses
+const TOKEN0_ADDRESS = "0x1c95519d3fc922fc04fcf5d099be4a1ed8b15240"; // Token to sell
+const TOKEN1_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; // WETH
+
+// Function to create a new WebSocket connection to Bitquery
+const createBitqueryConnection = (
+  resolveCallback: (value: boolean) => void
+) => {
+  const token = process.env.BITQUERY_TOKEN;
+  if (!token) {
+    console.error("BITQUERY_TOKEN not found in environment variables");
+    resolveCallback(false);
+    return;
+  }
+
+  const bitqueryConnection = new WebSocket(
+    "wss://streaming.bitquery.io/graphql?token=" + token,
+    ["graphql-ws"]
+  );
+
+  bitqueryConnection.on("open", () => {
+    console.log("Connected to Bitquery.");
+
+    // Send initialization message
+    const initMessage = JSON.stringify({ type: "connection_init" });
+    bitqueryConnection.send(initMessage);
+  });
+
+  bitqueryConnection.on("message", (data: WebSocket.Data) => {
+    // Convert Buffer or ArrayBuffer to string if needed
+    const dataString = data.toString();
+    const response = JSON.parse(dataString);
+
+    // Handle connection acknowledgment
+    if (response.type === "connection_ack") {
+      console.log("Connection acknowledged by Bitquery server.");
+
+      // Send subscription message
+      const subscriptionMessage = JSON.stringify({
+        type: "start",
+        id: "1",
+        payload: {
+          query: `
+          subscription MyQuery {
+            EVM(network: eth, mempool: true) {
+              DEXTradeByTokens(
+                where: {
+                  TransactionStatus: {Success: true}, 
+                  Trade: {
+                    Dex: {ProtocolFamily: {is: "Uniswap"}}, 
+                    Side: {
+                      Currency: {SmartContract: {is: "${TOKEN1_ADDRESS}"}}, 
+                      Type: {is: sell}, 
+                      AmountInUSD: {ge: "1"}
+                    }, 
+                    Currency: {SmartContract: {is: "${TOKEN0_ADDRESS}"}}
+                  }
+                }
+              ) {
+                Block{
+                  Time
+                  Number
+                }
+                  Transaction{
+                  Hash
+                  }
+                Trade {
+                  Amount
+                }
+              }
+            }
+          }
+          `,
+        },
+      });
+
+      bitqueryConnection.send(subscriptionMessage);
+      console.log("Subscription message sent to Bitquery.");
+    }
+
+    // Handle received data
+    if (response.type === "data" && response.payload.data) {
+      console.log("Detected matching trade in mempool!");
+
+      // Log trade details
+      const trades = response.payload.data.EVM?.DEXTradeByTokens;
+      if (trades && trades.length > 0) {
+        console.log("Trade details:", trades[0].Trade);
+
+        // We've detected a trade, stop the subscription and signal to continue
+        const stopMessage = JSON.stringify({ type: "stop", id: "1" });
+        bitqueryConnection.send(stopMessage);
+        console.log("Stop message sent to Bitquery.");
+
+        setTimeout(() => {
+          bitqueryConnection.close();
+          // Signal that we've detected a trade and can continue with the swap
+          resolveCallback(true);
+        }, 1000);
+      }
+    }
+
+    // Handle errors
+    if (response.type === "error") {
+      console.error("Error from Bitquery:", response);
+    }
+  });
+
+  bitqueryConnection.on("close", () => {
+    console.log("Disconnected from Bitquery.");
+  });
+
+  bitqueryConnection.on("error", (error: Error) => {
+    console.error("WebSocket Error:", error);
+    resolveCallback(false);
+  });
+
+  // Add timeout to prevent hanging if no matching trades are found
+  // Adjust timeout as needed
+  setTimeout(() => {
+    console.log("Timeout reached. Closing Bitquery connection.");
+    bitqueryConnection.close();
+    resolveCallback(false);
+  }, 60000 * 10); // 10 minutes timeout
+};
+
 export const getTokens = async (): Promise<Tokens> => {
   try {
-    let data = JSON.stringify({
-      query:
-        'query {\n  EVM(network: base) {\n    Events(\n      limit: {count: 1}\n      orderBy: {descending: Block_Time}\n      where: {Log: {Signature: {Name: {is: "PoolCreated"}}, SmartContract: {is: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"}}, Arguments: {startsWith: {Value: {Address: {is: "0x4200000000000000000000000000000000000006"}}}}}\n    ) {\n      Transaction {\n        Hash\n      }\n      Block {\n        Time\n      }\n      Log {\n        Signature {\n          Name\n        }\n      }\n      Arguments {\n        Name\n        Type\n        Value {\n          ... on EVM_ABI_Integer_Value_Arg {\n            integer\n          }\n          ... on EVM_ABI_String_Value_Arg {\n            string\n          }\n          ... on EVM_ABI_Address_Value_Arg {\n            address\n          }\n          ... on EVM_ABI_BigInt_Value_Arg {\n            bigInteger\n          }\n          ... on EVM_ABI_Bytes_Value_Arg {\n            hex\n          }\n          ... on EVM_ABI_Boolean_Value_Arg {\n            bool\n          }\n        }\n      }\n    }\n  }\n}\n',
-      variables: "{}",
+    console.log("Initializing token contracts...");
+
+    // Initialize the token contracts
+    const Token0 = await buildERC20TokenWithContract(TOKEN0_ADDRESS, provider);
+    const Token1 = await buildERC20TokenWithContract(TOKEN1_ADDRESS, provider);
+
+    if (!Token0 || !Token1) {
+      throw new Error("Failed to initialize token contracts");
+    }
+
+    console.log(
+      `Token0 (${Token0.token.symbol}) and Token1 (${Token1.token.symbol}) initialized.`
+    );
+    console.log("Starting Bitquery subscription to monitor for trades...");
+
+    // Set up the Bitquery subscription and wait for a matching trade
+    const tradeDetected = await new Promise<boolean>((resolve) => {
+      createBitqueryConnection(resolve);
     });
-    const axiosConfig: AxiosRequestConfig = {
-      method: "post",
-      maxBodyLength: Infinity,
-      url: "https://streaming.bitquery.io/eap",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.BITQUERY_TOKEN}`, // put your oauth token here
-      },
-      data: data,
-    };
 
-    const response = await axios.request(axiosConfig);
-
-    const token0Address =
-      response.data.data.EVM.Events[0].Arguments[0].Value.address;
-    const token1Address =
-      response.data.data.EVM.Events[0].Arguments[1].Value.address;
-    console.log(token0Address);
-    console.log(token1Address);
-
-    const Token0 = await buildERC20TokenWithContract(
-      "0xd3f3d46FeBCD4CdAa2B83799b7A5CdcB69d135De",
-      provider
-    );
-    const Token1 = await buildERC20TokenWithContract(
-      "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
-      provider
-    );
+    if (tradeDetected) {
+      console.log("Trade detected! Proceeding with the swap.");
+    } else {
+      throw new Error("No trade detected");
+    }
 
     return { Token0, Token1 };
   } catch (error) {
-    console.error("Error fetching tokens:", error);
+    console.error("Error in getTokens:", error);
     return { Token0: null, Token1: null };
   }
 };
