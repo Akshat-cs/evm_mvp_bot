@@ -1,7 +1,7 @@
 ## Prerequisites
 
 1. Node.js and npm installed on your system.
-2. Bitquery Free Developer Account with OAuth token (follow instructions here).
+2. Bitquery Free Developer Account with OAuth token (follow instructions [here](https://docs.bitquery.io/docs/authorisation/how-to-generate/)).
 3. Wallet with some ETH for the transaction fees.
 
 ## Steps to run the bot on your Local Machine
